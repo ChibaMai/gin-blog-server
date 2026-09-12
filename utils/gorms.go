@@ -53,9 +53,13 @@ func InitMySQLDB() *gorm.DB {
 	// MakeMigrate(db)
 
 	sqlDB, _ := db.DB()
-	sqlDB.SetMaxIdleConns(10)                  // 设置连接池中的最大闲置连接
-	sqlDB.SetMaxOpenConns(100)                 // 设置数据库的最大连接数量
-	sqlDB.SetConnMaxLifetime(10 * time.Second) // 设置连接的最大可复用时间
+	// 优化连接池配置，避免连接耗尽或泄漏
+	sqlDB.SetMaxIdleConns(20)                   // 设置连接池中的最大闲置连接（增大以应对高并发）
+	sqlDB.SetMaxOpenConns(50)                   // 设置数据库的最大连接数量（根据硬件和QPS调整）
+	sqlDB.SetConnMaxLifetime(3600 * time.Second) // 设置连接的最大可复用时间（1小时）
+	sqlDB.SetConnMaxIdleTime(300 * time.Second)  // 设置空闲连接的最大保活时间（5分钟）
+
+	log.Printf("MySQL 连接池配置: MaxIdleConns=20, MaxOpenConns=50, MaxLifetime=3600s, MaxIdleTime=300s")
 
 	return db
 }

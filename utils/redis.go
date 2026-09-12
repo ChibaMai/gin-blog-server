@@ -49,33 +49,21 @@ func (*_redis) Keys(pattern string) []string {
 	return rdb.Keys(ctx, pattern).Val()
 }
 
-// redis 删除值
-func (*_redis) Del(key string) {
-	err := rdb.Del(ctx, key).Err()
-	if err != nil {
-		Logger.Error(REDIS_UTIL_ERR_PREFIX+"Del: ", zap.Error(err))
-		panic(err)
-	}
+// redis 删除值 - 返回 error
+func (*_redis) Del(key string) error {
+	return rdb.Del(ctx, key).Err()
 }
 
-// redis 设置 key value 过期时间
-func (*_redis) Set(key string, value interface{}, expiration time.Duration) {
-	err := rdb.Set(ctx, key, value, expiration).Err()
-	if err != nil {
-		Logger.Error(REDIS_UTIL_ERR_PREFIX+"Set: ", zap.Error(err))
-		panic(err)
-	}
+// redis 设置 key value 过期时间 - 返回 error
+func (*_redis) Set(key string, value interface{}, expiration time.Duration) error {
+	return rdb.Set(ctx, key, value, expiration).Err()
 }
 
 // 将 key 中存储的数字 + 1
 // 如果 key 不存在, 默认初始化为 0, 再执行 INCR 操作
 // 如果 值 包含错误的类型, 或是字符串类型的值不能表示为数字, 返回错误
-func (*_redis) Incr(key string) {
-	err := rdb.Incr(ctx, key).Err()
-	if err != nil {
-		Logger.Error(REDIS_UTIL_ERR_PREFIX+"Incr: ", zap.Error(err))
-		panic(err)
-	}
+func (*_redis) Incr(key string) error {
+	return rdb.Incr(ctx, key).Err()
 }
 
 // redis 获取值
@@ -83,14 +71,9 @@ func (*_redis) GetVal(key string) string {
 	return rdb.Get(ctx, key).Val()
 }
 
-// redis 获取数字
-func (*_redis) GetInt(key string) int {
-	val, _ := rdb.Get(ctx, key).Int()
-	// if err != nil {
-	// 	Logger.Error(REDIS_UTIL_ERR_PREFIX+"GetInt: ", zap.Error(err))
-	// 	panic(err)
-	// }
-	return val
+// redis 获取数字 - 返回 error
+func (*_redis) GetInt(key string) (int, error) {
+	return rdb.Get(ctx, key).Int()
 }
 
 // 从 redis 中取值, 不存在会有 redis: nil 的错误
@@ -98,13 +81,9 @@ func (*_redis) GetResult(key string) (string, error) {
 	return rdb.Get(ctx, key).Result()
 }
 
-// 往 [集合(Set)] 中添加 元素
-func (*_redis) SAdd(key string, members ...any) {
-	err := rdb.SAdd(ctx, key, members...).Err()
-	if err != nil {
-		Logger.Error(REDIS_UTIL_ERR_PREFIX+"SAdd: ", zap.Error(err))
-		panic(err)
-	}
+// 往 [集合(Set)] 中添加 元素 - 返回 error
+func (*_redis) SAdd(key string, members ...any) error {
+	return rdb.SAdd(ctx, key, members...).Err()
 }
 
 // 判断 元素 是否是 [集合(Set)] 的成员
@@ -117,26 +96,22 @@ func (*_redis) SMembers(key string) []string {
 	return rdb.SMembers(ctx, key).Val()
 }
 
-// 移除 [集合(Set)] 中的元素
-func (*_redis) SRem(key string, member any) {
-	rdb.SRem(ctx, key, member)
+// 移除 [集合(Set)] 中的元素 - 返回 error
+func (*_redis) SRem(key string, member any) error {
+	return rdb.SRem(ctx, key, member).Err()
 }
 
 // 为[哈希表(Hash)]中的字段值加上指定增量值 (可以为负)
 // 如果 key 不存在, 自动创建哈希表并执行操作
 // 如果 field 不存在, 创建该字段值并初始化为 0
-func (*_redis) HIncrBy(key, field string, incr int64) {
-	err := rdb.HIncrBy(ctx, key, field, incr).Err()
-	if err != nil {
-		Logger.Error(REDIS_UTIL_ERR_PREFIX+"HIncrBy: ", zap.Error(err))
-		panic(err)
-	}
+// 返回 error
+func (*_redis) HIncrBy(key, field string, incr int64) error {
+	return rdb.HIncrBy(ctx, key, field, incr).Err()
 }
 
-// 获取[哈希表(Hash)]中 指定字段的值
-func (*_redis) HGet(key, filed string) int {
-	val, _ := rdb.HGet(ctx, key, filed).Int()
-	return val
+// 获取[哈希表(Hash)]中 指定字段的值 - 返回 error
+func (*_redis) HGet(key, filed string) (int, error) {
+	return rdb.HGet(ctx, key, filed).Int()
 }
 
 // 获取[哈希表(Hash)]中 所有的字段和值
@@ -152,18 +127,18 @@ func (*_redis) ZRangeWithScores(key string, start, stop int64) []redis.Z {
 	return rdb.ZRangeWithScores(ctx, key, start, stop).Val()
 }
 
-// 获取[有序集合]中, 成员的分数值
-func (*_redis) ZScore(key, member string) int {
-	return int(rdb.ZScore(ctx, key, member).Val())
+// 获取[有序集合]中, 成员的分数值 - 返回 error
+func (*_redis) ZScore(key, member string) (int, error) {
+	val, err := rdb.ZScore(ctx, key, member).Result()
+	if err != nil {
+		return 0, err
+	}
+	return int(val), nil
 }
 
-// [有序集合]中 key 中指定字段的整数值加上增量 incr
-func (*_redis) ZincrBy(key, member string, incr float64) {
-	err := rdb.ZIncrBy(ctx, key, incr, member).Err()
-	if err != nil {
-		Logger.Error(REDIS_UTIL_ERR_PREFIX+"ZincrBy: ", zap.Error(err))
-		panic(err)
-	}
+// [有序集合]中 key 中指定字段的整数值加上增量 incr - 返回 error
+func (*_redis) ZincrBy(key, member string, incr float64) error {
+	return rdb.ZIncrBy(ctx, key, incr, member).Err()
 }
 
 // type Options struct {

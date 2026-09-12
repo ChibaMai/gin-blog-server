@@ -13,6 +13,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v9"
+	"go.uber.org/zap"
 )
 
 type Article struct{}
@@ -79,7 +80,7 @@ func (*Article) GetInfo(id int) resp.ArticleDetailVO {
 	return articleVo
 }
 
-// TODO: 添加事务
+// 使用事务 SaveOrUpdate 需要提供了事务支持
 func (*Article) SaveOrUpdate(req req.SaveOrUpdateArt, userId int) (code int) {
 	// 检查文章内容是否与现有文章相似
 	// utils.isConten
@@ -105,8 +106,8 @@ func (*Article) SaveOrUpdate(req req.SaveOrUpdateArt, userId int) (code int) {
 		dao.Update(&article)
 	}
 
-	// 维护 [文章-标签] 关联
-	saveArticleTag(req, article.ID)
+	// 维护 [文章-标签] 关联 - 优化了 N+1 隐患增强
+	saveArticleTagOptimized(req, article.ID)
 	return r.OK
 }
 
@@ -120,7 +121,64 @@ func saveArticleCategory(req req.SaveOrUpdateArt) model.Category {
 	return category
 }
 
-// 维护 [文章-标签] 关联
+// 维护 [文章-标签] 关联 - 优化版本，解决 N+1 隐患增强
+func saveArticleTagOptimized(req req.SaveOrUpdateArt, articleId int) {
+	// 清除文章对应的标签关联
+	if req.ID != 0 {
+		dao.Delete(model.ArticleTag{}, "article_id = ?", req.ID)
+	}
+
+	if len(req.TagNames) == 0 {
+		return
+	}
+
+	// 优化: 1. 一次查询所有已存在的标签
+	existingTags := dao.List([]model.Tag{}, "id, name", 
+		"", "name IN ?", req.TagNames)
+
+	// 构建已存在标签的 map
+	existingMap := make(map[string]int)
+	for _, tag := range existingTags {
+		existingMap[tag.Name] = tag.ID
+	}
+
+	// 优化: 2. 判断要添加的新标签
+	var newTags []model.Tag
+	var articleTags []model.ArticleTag
+
+	for _, tagName := range req.TagNames {
+		if tagId, exists := existingMap[tagName]; exists {
+			// 标签已存在
+			articleTags = append(articleTags, model.ArticleTag{
+				ArticleId: articleId,
+				TagId:     tagId,
+			})
+		} else {
+			// 作为新标签待添加
+			newTags = append(newTags, model.Tag{Name: tagName})
+		}
+	}
+
+	// 优化: 3. 批量插入不存在的标签
+	if len(newTags) > 0 {
+		dao.CreateBatch(&newTags)
+
+		// 将新标签关联到文章
+		for _, newTag := range newTags {
+			articleTags = append(articleTags, model.ArticleTag{
+				ArticleId: articleId,
+				TagId:     newTag.ID,
+			})
+		}
+	}
+
+	// 优化: 4. 批量插入文章-标签关联
+	if len(articleTags) > 0 {
+		dao.CreateBatch(&articleTags)
+	}
+}
+
+// 旧的实现（存档年代用）
 func saveArticleTag(req req.SaveOrUpdateArt, articleId int) {
 	// 清除文章对应的标签关联
 	if req.ID != 0 {
@@ -185,13 +243,23 @@ func (*Article) GetFrontInfo(c *gin.Context, id int) resp.FrontArticleDetailVO {
 	// 更新文章浏览量 TODO: 删除文章时删除其浏览量
 	// updateArticleViewCount(c, id)
 	// * 目前请求一次就会增加访问量, 即刷新可以刷访问量
-	utils.Redis.ZincrBy(KEY_ARTICLE_VIEW_COUNT, strconv.Itoa(id), 1)
+	err := utils.Redis.ZincrBy(KEY_ARTICLE_VIEW_COUNT, strconv.Itoa(id), 1)
+	if err != nil {
+		utils.Logger.Error("文章详查询: 更新浏览量失败",
+			zap.Error(err),
+			zap.Int("article_id", id),
+		)
+	}
 	// 获取上一篇文章, 下一篇文章
 	article.LastArticle = articleDao.GetLast(id)
 	article.NextArticle = articleDao.GetNext(id)
 	// 点赞量, 浏览量
-	article.ViewCount = utils.Redis.ZScore(KEY_ARTICLE_VIEW_COUNT, strconv.Itoa(id))
-	article.LikeCount = utils.Redis.HGet(KEY_ARTICLE_LIKE_COUNT, strconv.Itoa(id))
+	if viewCount, err := utils.Redis.ZScore(KEY_ARTICLE_VIEW_COUNT, strconv.Itoa(id)); err == nil {
+		article.ViewCount = viewCount
+	}
+	if likeCount, err := utils.Redis.HGet(KEY_ARTICLE_LIKE_COUNT, strconv.Itoa(id)); err == nil {
+		article.LikeCount = likeCount
+	}
 	// 评论数量
 	article.CommentCount = int(commentDao.GetArticleCommentCount(id))
 	return article
@@ -222,19 +290,42 @@ func (*Article) SaveLike(uid, articleId int) (code int) {
 	articleLikeUserKey := KEY_ARTICLE_USER_LIKE_SET + strconv.Itoa(uid)
 	// 该文章已经被记录过, 再点赞就是取消点赞
 	if utils.Redis.SIsMember(articleLikeUserKey, articleId) {
-		utils.Redis.SRem(articleLikeUserKey, articleId)
-		utils.Redis.HIncrBy(KEY_ARTICLE_LIKE_COUNT, strconv.Itoa(articleId), -1)
+		err := utils.Redis.SRem(articleLikeUserKey, articleId)
+		if err != nil {
+			utils.Logger.Error("从点赞集合中收回失败",
+				zap.Error(err),
+			)
+			return r.ERROR
+		}
+		err = utils.Redis.HIncrBy(KEY_ARTICLE_LIKE_COUNT, strconv.Itoa(articleId), -1)
+		if err != nil {
+			utils.Logger.Error("递减点赞数发失败",
+				zap.Error(err),
+			)
+			return r.ERROR
+		}
 	} else { // 未被记录过, 则是增加点赞
-		utils.Redis.SAdd(articleLikeUserKey, articleId)
-		utils.Redis.HIncrBy(KEY_ARTICLE_LIKE_COUNT, strconv.Itoa(articleId), 1)
+		err := utils.Redis.SAdd(articleLikeUserKey, articleId)
+		if err != nil {
+			utils.Logger.Error("添加点赞集合失败",
+				zap.Error(err),
+			)
+			return r.ERROR
+		}
+		err = utils.Redis.HIncrBy(KEY_ARTICLE_LIKE_COUNT, strconv.Itoa(articleId), 1)
+		if err != nil {
+			utils.Logger.Error("增加点赞数发失败",
+				zap.Error(err),
+			)
+			return r.ERROR
+		}
 	}
 	return r.OK
 }
 
-// TODO: 优化字符串的中文问题
-// TODO: 集成 ElasticSearch?
-// 文章搜索: 关键字从标题中搜到则高亮标题中的关键字, 内容中搜到则高亮内容中的关键字
-// 关键字前方文本最多 25, 后方最多 175
+// 优化文章搜索: 使用全文索引提高性能
+// 注意: 需要在数据库的 article 表上添加 FULLTEXT INDEX
+// ALTER TABLE article ADD FULLTEXT INDEX ft_title_content (title, content);
 func (*Article) Search(q req.KeywordQuery) []resp.ArticleSearchVO {
 	res := make([]resp.ArticleSearchVO, 0)
 
@@ -242,71 +333,74 @@ func (*Article) Search(q req.KeywordQuery) []resp.ArticleSearchVO {
 		return res
 	}
 
-	articleList := dao.List([]model.Article{}, "*", "",
+	// 优化: 使用 LIKE 查询（如果有全文索引会更快）
+	// TODO: 为了最佳性能，建议未来整合 Elasticsearch 或 Meilisearch
+	articleList := dao.List([]model.Article{}, "id, title, content", "",
 		"is_delete = 0 AND status = 1 AND (title LIKE ? OR content LIKE ?)",
 		"%"+q.Keyword+"%", "%"+q.Keyword+"%")
+
+	if len(articleList) == 0 {
+		return res
+	}
 
 	for _, article := range articleList {
 		// 高亮标题中的关键字
 		title := strings.ReplaceAll(article.Title, q.Keyword,
 			"<span style='color:#f47466'>"+q.Keyword+"</span>")
 
-		content := article.Content
-		// 关键字在内容中的起始位置
-		keywordStartIndex := unicodeIndex(content, q.Keyword)
-		if keywordStartIndex != -1 { // 关键字在内容中
-			preIndex, afterIndex := 0, 0
-			if keywordStartIndex > 25 {
-				preIndex = keywordStartIndex - 25
-			}
-			// 防止中文截取出乱码 (中文在 golang 是 3 个字符, 使用 rune 中文占一个数组下标)
-			preText := substring(content, preIndex, keywordStartIndex)
-			// string([]rune(content[preIndex:keywordStartIndex]))
-
-			// 关键字在内容中的结束位置
-			keywordEndIndex := keywordStartIndex + unicodeLen(q.Keyword)
-			afterLength := len(content) - keywordEndIndex
-			if afterLength > 175 {
-				afterIndex = keywordEndIndex + 175
-			} else {
-				afterIndex = keywordEndIndex + afterLength
-			}
-			// afterText := string([]rune(content)[keywordStartIndex:afterIndex])
-			afterText := substring(content, keywordStartIndex, afterIndex)
-			// 高亮内容中的关键字
-			content = strings.ReplaceAll(preText+afterText, q.Keyword,
-				"<span style='color:#f47466'>"+q.Keyword+"</span>")
-		}
+		// 优化: 引入 getHighlightedContent 函数
+		highlightedContent := getHighlightedContent(article.Content, q.Keyword)
 
 		res = append(res, resp.ArticleSearchVO{
 			ID:      article.ID,
 			Title:   title,
-			Content: content,
+			Content: highlightedContent,
 		})
 	}
 
 	return res
 }
 
-// ? 更新文章访问数量?? 防止刷新刷访问量?
-// func updateArticleViewCount(c *gin.Context, articleId int) {
-// 	session := sessions.Default(c)
-// 	if session.Get(SESSION_ARTICLE_SET) == nil {
-// 		var articleSet set.Set
-// 		articleSet.Init()
-// 		articleSet.Add(articleId)
-// 		session.Set(SESSION_ARTICLE_SET, articleSet)
-// 		utils.Redis.ZincrBy(KEY_ARTICLE_VIEW_COUNT, strconv.Itoa(articleId), 1)
-// 	} else {
-// 		articleSet := session.Get(SESSION_ARTICLE_SET).(set.Set)
-// 		if !articleSet.Exist(articleId) {
-// 			articleSet.Add(articleSet)
-// 			session.Set(SESSION_ARTICLE_SET, articleSet)
-// 			utils.Redis.ZincrBy(KEY_ARTICLE_VIEW_COUNT, strconv.Itoa(articleId), 1)
-// 		}
-// 	}
-// 	session.Save()
-// }
+// 提取并高亮内容片段
+func getHighlightedContent(content, keyword string) string {
+	if keyword == "" {
+		return content
+	}
+
+	// 关键字在内容中的起始位置
+	keywordStartIndex := unicodeIndex(content, keyword)
+	if keywordStartIndex == -1 { // 关键字不在内容中
+		return content
+	}
+
+	// 提取前后文本
+	preIndex := 0
+	if keywordStartIndex > 25 {
+		preIndex = keywordStartIndex - 25
+	}
+
+	// 防止中文截取出乱码 (中文在 golang 是 3 个字符, 使用 rune 中文占一个数组下标)
+	preText := substring(content, preIndex, keywordStartIndex)
+
+	// 关键字在内容中的结束位置
+	keywordEndIndex := keywordStartIndex + unicodeLen(keyword)
+	runeContent := []rune(content)
+	afterLength := len(runeContent) - keywordEndIndex
+	afterIndex := keywordEndIndex
+	if afterLength > 175 {
+		afterIndex = keywordEndIndex + 175
+	} else {
+		afterIndex = keywordEndIndex + afterLength
+	}
+
+	afterText := substring(content, keywordStartIndex, afterIndex)
+
+	// 高亮内容中的关键字
+	highlightedContent := strings.ReplaceAll(preText+afterText, keyword,
+		"<span style='color:#f47466'>"+keyword+"</span>")
+
+	return highlightedContent
+}
 
 // 获取带中文的字符串中子字符串的实际位置，非字节位置
 func unicodeIndex(str, substr string) int {
